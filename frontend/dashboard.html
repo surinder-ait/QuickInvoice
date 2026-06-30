@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard — QuickInvoice</title>
+  <link rel="stylesheet" href="css/main.css">
+  <link rel="stylesheet" href="css/components.css">
+  <!--
+    SECURITY-13: Chart.js loaded from CDN with Subresource Integrity hash.
+    Hash must be updated when upgrading Chart.js version.
+  -->
+  <script
+    src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
+    integrity="sha384-eI7PSr3L1ixTKPFjBzOoE8ywvK9V7P3TwLpzSm3PzVQqjbQKH9CABKbWw5lEnWX"
+    crossorigin="anonymous"
+    defer
+  ></script>
+</head>
+<body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+
+  <nav class="nav" role="navigation" aria-label="Main navigation">
+    <div class="nav-inner">
+      <a href="/dashboard.html" class="nav-brand" aria-label="QuickInvoice home">QuickInvoice</a>
+      <ul class="nav-links" role="list">
+        <li><a href="/dashboard.html" class="active" aria-current="page">Dashboard</a></li>
+        <li><a href="/clients.html">Clients</a></li>
+        <li><a href="/invoices.html">Invoices</a></li>
+      </ul>
+      <div class="nav-actions">
+        <button id="logout-btn" class="btn btn-ghost btn-sm" data-testid="logout-button">Sign Out</button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main-content" class="main">
+    <div class="container">
+      <div class="page-header mb-6">
+        <h1 class="page-title">Dashboard</h1>
+        <a href="/invoices.html?new=1" class="btn btn-primary" data-testid="new-invoice-button">+ New Invoice</a>
+      </div>
+
+      <div id="loading" class="loading" aria-live="polite" aria-label="Loading dashboard data">
+        <div class="spinner" role="status"><span class="sr-only">Loading…</span></div>
+      </div>
+
+      <div id="dashboard-content" class="hidden">
+        <!-- Metric cards -->
+        <div class="metric-grid mb-8" role="region" aria-label="Financial summary">
+          <div class="card metric-card">
+            <div class="metric-value" id="metric-outstanding" aria-label="Outstanding">—</div>
+            <div class="metric-label">Outstanding</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-value" id="metric-overdue" style="color:var(--color-danger);" aria-label="Overdue">—</div>
+            <div class="metric-label">Overdue</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-value" id="metric-month" aria-label="Revenue this month">—</div>
+            <div class="metric-label">This Month</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-value" id="metric-year" aria-label="Revenue this year">—</div>
+            <div class="metric-label">This Year</div>
+          </div>
+          <div class="card metric-card">
+            <div class="metric-value" id="metric-avg-days" aria-label="Average payment time">—</div>
+            <div class="metric-label">Avg. Payment Time</div>
+          </div>
+        </div>
+
+        <!-- Revenue chart -->
+        <div class="card mb-8">
+          <div class="card-header">
+            <h2 class="card-title">Revenue Overview</h2>
+          </div>
+          <canvas id="revenue-chart" aria-label="Revenue bar chart" role="img" height="120"></canvas>
+        </div>
+
+        <!-- Two-column: recent activity + top clients -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;" class="mb-8">
+          <div class="card">
+            <div class="card-header"><h2 class="card-title">Recent Activity</h2></div>
+            <div class="table-wrapper">
+              <table class="table" aria-label="Recent invoices">
+                <thead>
+                  <tr>
+                    <th scope="col">Invoice</th>
+                    <th scope="col">Status</th>
+                    <th scope="col" style="text-align:right">Amount</th>
+                  </tr>
+                </thead>
+                <tbody id="recent-activity-body">
+                  <tr><td colspan="3" class="table-empty">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header"><h2 class="card-title">Top Clients</h2></div>
+            <div class="table-wrapper">
+              <table class="table" aria-label="Top clients by revenue">
+                <thead>
+                  <tr>
+                    <th scope="col">Client</th>
+                    <th scope="col" style="text-align:right">Revenue</th>
+                  </tr>
+                </thead>
+                <tbody id="top-clients-body">
+                  <tr><td colspan="2" class="table-empty">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    import { apiRefreshOnLoad, apiGetDashboard, apiLogout } from './js/api-client.js';
+
+    function formatAUD(cents) {
+      return new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD' }).format(cents / 100);
+    }
+
+    function statusBadge(status) {
+      return `<span class="badge badge-${status}">${status}</span>`;
+    }
+
+    document.getElementById('logout-btn').addEventListener('click', apiLogout);
+
+    async function init() {
+      const authed = await apiRefreshOnLoad();
+      if (!authed) { window.location.href = '/login.html'; return; }
+
+      try {
+        const data = await apiGetDashboard();
+        document.getElementById('loading').classList.add('hidden');
+        document.getElementById('dashboard-content').classList.remove('hidden');
+
+        document.getElementById('metric-outstanding').textContent = formatAUD(data.outstandingTotal);
+        document.getElementById('metric-overdue').textContent = formatAUD(data.overdueTotal);
+        document.getElementById('metric-month').textContent = formatAUD(data.revenueThisMonth);
+        document.getElementById('metric-year').textContent = formatAUD(data.revenueThisYear);
+        document.getElementById('metric-avg-days').textContent =
+          data.avgPaymentTimeDays !== null ? `${data.avgPaymentTimeDays} days` : 'N/A';
+
+        // Revenue chart
+        const ctx = document.getElementById('revenue-chart').getContext('2d');
+        new Chart(ctx, {
+          type: 'bar',
+          data: {
+            labels: ['This Month', 'This Year'],
+            datasets: [{
+              label: 'Revenue (AUD)',
+              data: [data.revenueThisMonth / 100, data.revenueThisYear / 100],
+              backgroundColor: ['#3b82f6', '#6366f1'],
+              borderRadius: 6,
+            }],
+          },
+          options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, ticks: { callback: v => `$${v}` } } },
+          },
+        });
+
+        // Recent activity
+        const activityBody = document.getElementById('recent-activity-body');
+        if (data.recentActivity.length === 0) {
+          activityBody.innerHTML = '<tr><td colspan="3" class="table-empty">No invoices yet</td></tr>';
+        } else {
+          activityBody.innerHTML = data.recentActivity.map(i => `
+            <tr>
+              <td><a href="/invoices.html?id=${i.invoiceId}">${i.invoiceNumber}</a></td>
+              <td>${statusBadge(i.status)}</td>
+              <td style="text-align:right">${formatAUD(i.grandTotal)}</td>
+            </tr>
+          `).join('');
+        }
+
+        // Top clients
+        const topBody = document.getElementById('top-clients-body');
+        if (data.topClients.length === 0) {
+          topBody.innerHTML = '<tr><td colspan="2" class="table-empty">No data yet</td></tr>';
+        } else {
+          topBody.innerHTML = data.topClients.map(c => `
+            <tr>
+              <td>${c.clientId}</td>
+              <td style="text-align:right">${formatAUD(c.totalRevenue)}</td>
+            </tr>
+          `).join('');
+        }
+
+      } catch (err) {
+        document.getElementById('loading').innerHTML =
+          '<p class="text-muted">Failed to load dashboard. Please refresh.</p>';
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

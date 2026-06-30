@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create Account — QuickInvoice</title>
+  <link rel="stylesheet" href="css/main.css">
+  <link rel="stylesheet" href="css/components.css">
+</head>
+<body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+  <main id="main-content" class="container">
+    <div class="auth-card card">
+      <div class="auth-title">
+        <h1 style="font-size:1.75rem; margin-bottom:.25rem;">QuickInvoice</h1>
+        <p class="text-muted">Create your free account</p>
+      </div>
+
+      <div id="alert" class="alert hidden" role="alert" aria-live="polite"></div>
+
+      <form id="register-form" novalidate data-testid="register-form">
+        <div class="form-group">
+          <label for="displayName" class="form-label">Full Name <span class="required" aria-hidden="true">*</span></label>
+          <input type="text" id="displayName" name="displayName" class="form-control"
+            autocomplete="name" required maxlength="100" aria-required="true"
+            data-testid="register-name-input">
+        </div>
+
+        <div class="form-group">
+          <label for="email" class="form-label">Email <span class="required" aria-hidden="true">*</span></label>
+          <input type="email" id="email" name="email" class="form-control"
+            autocomplete="email" required maxlength="254" aria-required="true"
+            data-testid="register-email-input">
+        </div>
+
+        <div class="form-group">
+          <label for="password" class="form-label">Password <span class="required" aria-hidden="true">*</span></label>
+          <input type="password" id="password" name="password" class="form-control"
+            autocomplete="new-password" required minlength="8" maxlength="128" aria-required="true"
+            data-testid="register-password-input">
+          <span class="form-hint">Minimum 8 characters.</span>
+        </div>
+
+        <button type="submit" class="btn btn-primary" style="width:100%;" data-testid="register-submit-button">
+          Create Account
+        </button>
+      </form>
+
+      <p class="text-center text-sm mt-4">
+        Already have an account? <a href="/login.html">Sign in</a>
+      </p>
+    </div>
+  </main>
+
+  <script type="module">
+    import { apiRegister } from './js/api-client.js';
+
+    const form = document.getElementById('register-form');
+    const alertEl = document.getElementById('alert');
+
+    function showAlert(msg, type = 'error') {
+      alertEl.textContent = msg;
+      alertEl.className = `alert alert-${type}`;
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = form.querySelector('[type=submit]');
+      btn.disabled = true;
+      btn.textContent = 'Creating account…';
+
+      try {
+        const res = await apiRegister(
+          document.getElementById('email').value.trim(),
+          document.getElementById('password').value,
+          document.getElementById('displayName').value.trim(),
+        );
+        if (res.ok) {
+          showAlert('Account created! Please check your email to verify your address.', 'success');
+          form.reset();
+        } else {
+          const { error } = await res.json().catch(() => ({ error: 'Registration failed' }));
+          showAlert(error || 'Registration failed. Please try again.');
+        }
+      } catch {
+        showAlert('Network error. Please check your connection.');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Create Account';
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: QuickInvoice — Serverless invoice management platform
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    Timeout: 10
+    MemorySize: 128
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_NAME: !Ref QuickInvoiceTable
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+        JWT_ISSUER: quickinvoice
+        JWT_AUDIENCE: quickinvoice-api
+        ACCESS_TOKEN_EXPIRY_SECONDS: '900'
+        REFRESH_TOKEN_EXPIRY_SECONDS: '604800'
+        SES_FROM_ADDRESS: !Ref SESFromAddress
+        APP_BASE_URL: !Ref AppBaseUrl
+        JWT_PRIVATE_KEY_SECRET_ARN: !Ref JWTPrivateKeySecretArn
+        JWT_PUBLIC_KEY_SECRET_ARN: !Ref JWTPublicKeySecretArn
+    Layers:
+      - !Ref DependenciesLayer
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  SESFromAddress:
+    Type: String
+    Default: noreply@quickinvoice.com
+  AppBaseUrl:
+    Type: String
+    Default: https://app.quickinvoice.com
+  JWTPrivateKeySecretArn:
+    Type: String
+  JWTPublicKeySecretArn:
+    Type: String
+
+Resources:
+
+  # ── DynamoDB ─────────────────────────────────────────────────────────────────
+  QuickInvoiceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'quickinvoice-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true        # SECURITY-01: Encryption at rest
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── Lambda Layer ─────────────────────────────────────────────────────────────
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'quickinvoice-deps-${Environment}'
+      ContentUri: dist/layer/
+      CompatibleRuntimes: [nodejs20.x]
+      RetentionPolicy: Delete
+
+  # ── JWT Authorizer ────────────────────────────────────────────────────────────
+  JWTAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'quickinvoice-jwt-authorizer-${Environment}'
+      Handler: auth/handlers/jwt-authorizer-handler.handler
+      CodeUri: dist/
+      MemorySize: 128
+      Timeout: 3
+      ReservedConcurrentExecutions: 1  # Provisioned warmth for authorizer
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref JWTPublicKeySecretArn
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt QuickInvoiceTable.Arn
+
+  # ── API Gateway ───────────────────────────────────────────────────────────────
+  QuickInvoiceApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'quickinvoice-api-${Environment}'
+      StageName: !Ref Environment
+      TracingEnabled: true
+      AccessLogSetting:                   # SECURITY-02: Access logging
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: ERROR
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 100     # SECURITY-11: Rate limiting
+          ThrottlingRateLimit: 50
+      Cors:
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: !Sub "'https://app.quickinvoice.com'"  # SECURITY-08: No wildcard CORS
+      Auth:
+        DefaultAuthorizer: JWTAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          JWTAuthorizer:
+            FunctionArn: !GetAtt JWTAuthorizerFunction.Arn
+            FunctionPayloadType: TOKEN
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 300
+
+  # ── Auth Lambda ────────────────────────────────────────────────────────────────
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'quickinvoice-auth-${Environment}'
+      Handler: auth/handlers/auth-handler.handler
+      CodeUri: dist/
+      MemorySize: 256      # bcrypt is CPU-intensive
+      Timeout: 10
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt QuickInvoiceTable.Arn
+                - !Sub '${QuickInvoiceTable.Arn}/index/*'
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref JWTPrivateKeySecretArn
+                - !Ref JWTPublicKeySecretArn
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
+      Events:
+        RegisterPost:   { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/register,        Method: POST, Auth: { Authorizer: NONE } } }
+        LoginPost:      { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/login,           Method: POST, Auth: { Authorizer: NONE } } }
+        LogoutPost:     { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/logout,          Method: POST } }
+        RefreshPost:    { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/refresh,         Method: POST, Auth: { Authorizer: NONE } } }
+        VerifyGet:      { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/verify-email,    Method: GET,  Auth: { Authorizer: NONE } } }
+        ForgotPost:     { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/forgot-password, Method: POST, Auth: { Authorizer: NONE } } }
+        ResetPost:      { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /auth/reset-password,  Method: POST, Auth: { Authorizer: NONE } } }
+
+  # ── Clients Lambda ─────────────────────────────────────────────────────────────
+  ClientsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'quickinvoice-clients-${Environment}'
+      Handler: clients/handlers/clients-handler.handler
+      CodeUri: dist/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: !GetAtt QuickInvoiceTable.Arn
+      Events:
+        ClientsList:   { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /clients,     Method: GET } }
+        ClientsCreate: { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /clients,     Method: POST } }
+        ClientsGet:    { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /clients/{id}, Method: GET } }
+        ClientsUpdate: { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /clients/{id}, Method: PUT } }
+        ClientsDelete: { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /clients/{id}, Method: DELETE } }
+
+  # ── Invoices Lambda ─────────────────────────────────────────────────────────────
+  InvoicesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'quickinvoice-invoices-${Environment}'
+      Handler: invoices/handlers/invoices-handler.handler
+      CodeUri: dist/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource:
+                - !GetAtt QuickInvoiceTable.Arn
+                - !Sub '${QuickInvoiceTable.Arn}/index/*'
+      Events:
+        InvoicesList:      { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices,               Method: GET } }
+        InvoicesCreate:    { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices,               Method: POST } }
+        InvoicesGet:       { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices/{id},          Method: GET } }
+        InvoicesUpdate:    { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices/{id},          Method: PUT } }
+        InvoicesDelete:    { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices/{id},          Method: DELETE } }
+        InvoicesDuplicate: { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices/{id}/duplicate, Method: POST } }
+        InvoicesStatus:    { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices/{id}/status,  Method: PATCH } }
+
+  # ── PDF Lambda ──────────────────────────────────────────────────────────────────
+  PDFFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'quickinvoice-pdf-${Environment}'
+      Handler: pdf/handlers/pdf-handler.handler
+      CodeUri: dist/
+      MemorySize: 512
+      Timeout: 30
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt QuickInvoiceTable.Arn
+      Events:
+        PDFGet: { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /invoices/{id}/pdf, Method: GET } }
+
+  # ── Dashboard Lambda ────────────────────────────────────────────────────────────
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'quickinvoice-dashboard-${Environment}'
+      Handler: dashboard/handlers/dashboard-handler.handler
+      CodeUri: dist/
+      MemorySize: 128
+      Timeout: 15
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !GetAtt QuickInvoiceTable.Arn
+      Events:
+        DashboardGet: { Type: Api, Properties: { RestApiId: !Ref QuickInvoiceApi, Path: /dashboard, Method: GET } }
+
+  # ── CloudWatch Logs ────────────────────────────────────────────────────────────
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/quickinvoice-${Environment}'
+      RetentionInDays: 90    # SECURITY-14: 90-day minimum retention
+
+  AuthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/quickinvoice-auth-${Environment}'
+      RetentionInDays: 90
+
+  # ── CloudWatch Alarms ──────────────────────────────────────────────────────────
+  # SECURITY-14: Alert on elevated Lambda error rate
+  AuthErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'quickinvoice-auth-errors-${Environment}'
+      AlarmDescription: Auth Lambda error rate > 5% over 5 minutes
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AuthFunction
+      TreatMissingData: notBreaching
+
+  # ── S3 Frontend Bucket ─────────────────────────────────────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'quickinvoice-frontend-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:    # SECURITY-09: Block all public access
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:                  # SECURITY-01: Encryption at rest
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ── CloudFront ─────────────────────────────────────────────────────────────────
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'quickinvoice-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        DefaultRootObject: dashboard.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https    # SECURITY-01: HTTPS only
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Logging:                                     # SECURITY-02: CDN logging
+          Bucket: !GetAtt FrontendBucket.DomainName
+          Prefix: 'cloudfront-logs/'
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub 'quickinvoice-security-headers-${Environment}'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+            Override: true
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${QuickInvoiceApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+  CloudFrontUrl:
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+  DynamoDBTableName:
+    Value: !Ref QuickInvoiceTable
